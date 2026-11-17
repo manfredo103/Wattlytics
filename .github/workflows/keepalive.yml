@@ -11,10 +11,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Ping Netlify getConfig healthcheck endpoint
+        env:
+          SITE_URL: ${{ vars.NETLIFY_SITE_URL || secrets.NETLIFY_SITE_URL || 'https://wattlytics.netlify.app' }}
         run: |
           echo "Pinging healthcheck endpoint..."
           STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
-            "https://wattlytics.netlify.app/.netlify/functions/getConfig?id=healthcheck")
+            "$SITE_URL/.netlify/functions/getConfig?id=healthcheck")
 
           echo "HTTP Status: $STATUS"
 

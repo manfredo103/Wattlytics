@@ -64,7 +64,11 @@ export async function handler(event) {
     }
 
     // Log to GitHub
-    const logRes = await fetch(`${process.env.URL}/.netlify/functions/log-price`, {
+    const baseUrl =
+      process.env.DEPLOY_PRIME_URL ||
+      process.env.URL ||
+      (event.headers?.host ? `https://${event.headers.host}` : '');
+    const logRes = await fetch(`${baseUrl}/.netlify/functions/log-price`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({

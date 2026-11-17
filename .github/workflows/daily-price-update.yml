@@ -18,7 +18,7 @@ jobs:
       - name: Set up Node.js
         uses: actions/setup-node@v3
         with:
-          node-version: '16'
+          node-version: '20'
 
       - name: Install jq
         run: sudo apt-get install -y jq
@@ -27,14 +27,16 @@ jobs:
         run: npm install
 
       - name: Fetch live prices from Netlify Function
+        env:
+          SITE_URL: ${{ vars.NETLIFY_SITE_URL || secrets.NETLIFY_SITE_URL || 'https://wattlytics.netlify.app' }}
         run: |
-          curl -s "https://wattlytics.netlify.app/.netlify/functions/fetch-price?gpu=H100" > h100-price.json
-          curl -s "https://wattlytics.netlify.app/.netlify/functions/fetch-price?gpu=GH200" > gh200-price.json
-          curl -s "https://wattlytics.netlify.app/.netlify/functions/fetch-price?gpu=A100" > a100-price.json
-          curl -s "https://wattlytics.netlify.app/.netlify/functions/fetch-price?gpu=A40" > a40-price.json
-          curl -s "https://wattlytics.netlify.app/.netlify/functions/fetch-price?gpu=L4" > l4-price.json
-          curl -s "https://wattlytics.netlify.app/.netlify/functions/fetch-price?gpu=L40" > l40-price.json
-          curl -s "https://wattlytics.netlify.app/.netlify/functions/fetch-price?gpu=L40S" > l40s-price.json
+          curl -s "$SITE_URL/.netlify/functions/fetch-price?gpu=H100" > h100-price.json
+          curl -s "$SITE_URL/.netlify/functions/fetch-price?gpu=GH200" > gh200-price.json
+          curl -s "$SITE_URL/.netlify/functions/fetch-price?gpu=A100" > a100-price.json
+          curl -s "$SITE_URL/.netlify/functions/fetch-price?gpu=A40" > a40-price.json
+          curl -s "$SITE_URL/.netlify/functions/fetch-price?gpu=L4" > l4-price.json
+          curl -s "$SITE_URL/.netlify/functions/fetch-price?gpu=L40" > l40-price.json
+          curl -s "$SITE_URL/.netlify/functions/fetch-price?gpu=L40S" > l40s-price.json
 
       - name: Read current prices and update JSON
         run: |
@@ -79,4 +81,4 @@ jobs:
           git config --global user.email "action@github.com"
           git add data/prices.json
           git commit -m "Update GPU prices" || echo "No changes to commit"
-          git push https://x-access-token:${{ secrets.MY_GITHUB_TOKEN }}@github.com/${{ github.repository }}.git HEAD:main
+          git push https://x-access-token:${{ secrets.MY_GITHUB_TOKEN }}@github.com/${{ github.repository }}.git HEAD:${{ github.ref_name }}

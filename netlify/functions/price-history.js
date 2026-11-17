@@ -7,12 +7,18 @@ export async function handler() {
 
   const octokit = new Octokit({ auth: process.env.MY_GITHUB_TOKEN });
 
-  const owner = "AyeshaAfzal91";
-  const repo = "PerfPerTCO";  
+  const owner = process.env.GITHUB_OWNER || "manfredo103";
+  const repo = process.env.GITHUB_REPO || "Wattlytics";
+  const branch = process.env.GITHUB_BRANCH;
   const path = "data/prices.json";  
 
   try {
-    const { data: file } = await octokit.repos.getContent({ owner, repo, path });
+    const { data: file } = await octokit.repos.getContent({
+      owner,
+      repo,
+      path,
+      ...(branch ? { ref: branch } : {})
+    });
 
     const content = Buffer.from(file.content, 'base64').toString();
     const entries = JSON.parse(content);

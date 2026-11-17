@@ -3045,7 +3045,7 @@ async function generateBlogPost() {
 
     // --- STEP 1: Generate Share Link ---
     document.getElementById("blogOutput").value = "Generating share link, please wait...";
-    let shareUrl = 'https://wattlytics.netlify.app'; // Default URL
+    let shareUrl = window.location.origin; // Default URL
 
     try {
         const shareData = await shareSetup();

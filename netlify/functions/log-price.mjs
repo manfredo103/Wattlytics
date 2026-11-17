@@ -10,12 +10,18 @@ export async function handler(event) {
 
   const octokit = new Octokit({ auth: process.env.MY_GITHUB_TOKEN });
 
-  const owner = "AyeshaAfzal91";
-  const repo = "Wattlytics";
+  const owner = process.env.GITHUB_OWNER || "manfredo103";
+  const repo = process.env.GITHUB_REPO || "Wattlytics";
+  const branch = process.env.GITHUB_BRANCH;
   const path = "data/prices.json";
 
   try {
-    const { data: file } = await octokit.repos.getContent({ owner, repo, path });
+    const { data: file } = await octokit.repos.getContent({
+      owner,
+      repo,
+      path,
+      ...(branch ? { ref: branch } : {}),
+    });
     const content = Buffer.from(file.content, 'base64').toString();
     const json = Array.isArray(JSON.parse(content)) ? JSON.parse(content) : [];
 
@@ -30,6 +36,7 @@ export async function handler(event) {
       message: `Log ${gpu} price on ${date}`,
       content: updatedContent,
       sha: file.sha,
+      ...(branch ? { branch } : {}),
     });
 
     return {
