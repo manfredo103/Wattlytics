@@ -474,6 +474,7 @@ const GPU_F_REF = {
   L40S: 2520,
   A100: 1410,
   H100: 1980,
+  H200: 1980,
   GH200: 1980   
 };
 
@@ -484,6 +485,7 @@ const GPU_TDP_REF = {
   L40S: 300,
   A100: 400,
   H100: 700,
+  H200: 700,
   GH200: 900
 };
 
@@ -553,6 +555,7 @@ GPU_data.forEach(gpu => {
 });
 
 import { DVFS_PARAMS } from './Inputs/DVFS_PARAMS.js';
+import { PERF_DVFS_PARAMS, PERF_BENCHMARK_META, PERF_GPU_FREQ_BOUNDS } from './Inputs/PERF_DVFS_PARAMS.js';
 
 GPU_data.forEach(gpu => {
     const dvfs = DVFS_PARAMS[gpu.name]; 
@@ -576,6 +579,320 @@ function computeGpuPowerDVFS(gpu, basePower, gpuFreq, workload, benchmarkId) {
     phi = a2 * gpuFreq * gpuFreq + b2 * gpuFreq + c2;
   }
   return Math.min(phi, gpu.tdp_ref); // TDP CLAMP 
+}
+
+function computeGpuPerfDVFS(gpuName, basePerf, gpuFreq, workload, benchmarkId, { asWorkNormalized = true } = {}) {
+  const perfParams = PERF_DVFS_PARAMS[gpuName]?.[workload]?.[benchmarkId];
+  if (!perfParams) {
+    const f_ref = GPU_F_REF[gpuName] || 2000;
+    return basePerf ? basePerf * (gpuFreq / f_ref) : null;
+  }
+
+  const { f_t, b1, c1, a2, b2, c2, perf_max } = perfParams;
+  const raw = gpuFreq <= f_t
+    ? b1 * gpuFreq + c1
+    : a2 * gpuFreq * gpuFreq + b2 * gpuFreq + c2;
+  const clamped = Math.max(0, Math.min(raw, perf_max));
+
+  if (!asWorkNormalized) return clamped;
+  const atoms = PERF_BENCHMARK_META[workload]?.[benchmarkId]?.atoms || 1;
+  return clamped * atoms;
+}
+
+// ---------- Show Performance Model & Performance-Frequency Plots ----------
+let perfPlotChartInstances = [];
+
+function showPerfModel() {
+    const workload = document.getElementById("workload")?.value || "GROMACS";
+    const selectedBenchmark = parseInt(document.getElementById("benchmarkId")?.value, 10) || 1;
+    const fittedGpuNames = Object.keys(PERF_DVFS_PARAMS).filter(
+        gpuName => PERF_DVFS_PARAMS[gpuName]?.[workload] && Object.keys(PERF_DVFS_PARAMS[gpuName][workload]).length > 0
+    );
+
+    let tableHeader = "";
+    let rows = "";
+
+    if (fittedGpuNames.length > 0) {
+        const availableIds = Object.keys(PERF_DVFS_PARAMS[fittedGpuNames[0]][workload]).map(Number).sort((a, b) => a - b);
+        const benchId = availableIds.includes(selectedBenchmark) ? selectedBenchmark : availableIds[0];
+        const benchLabel = `Benchmark ${benchId}`;
+        const atoms = PERF_BENCHMARK_META[workload]?.[benchId]?.atoms || 1;
+
+        tableHeader = `
+            <tr>
+                <th>GPU</th>
+                <th>f_ref (MHz)</th>
+                <th>P_max (ns/day × atoms)</th>
+                <th>Fitted Performance Model (${workload} – ${benchLabel}, ${atoms.toLocaleString()} atoms): P(f_GPU) = min(P_max, φ(f_GPU)) × atoms</th>
+            </tr>
+        `;
+
+        rows = fittedGpuNames.map(gpuName => {
+            const f_ref = GPU_F_REF[gpuName] ?? "N/A";
+            const params = PERF_DVFS_PARAMS[gpuName]?.[workload]?.[benchId];
+            if (!params) {
+                return `
+                <tr>
+                    <td>${gpuName}</td>
+                    <td>${f_ref} MHz</td>
+                    <td>N/A</td>
+                    <td>No fitted performance parameters available</td>
+                </tr>
+                `;
+            }
+
+            const phiFormula = `φ(f_GPU) [ns/day] =
+{
+  ${params.b1.toFixed(6)} * f_GPU + ${params.c1.toFixed(4)},   if f_GPU ≤ ${params.f_t} MHz
+  ${params.a2.toExponential(4)} * f_GPU² + ${params.b2.toFixed(6)} * f_GPU + ${params.c2.toFixed(4)},   if f_GPU > ${params.f_t} MHz
+}
+P(f_GPU) = min(${params.perf_max.toFixed(2)}, φ(f_GPU)) * ${atoms}
+(RMSE: ${params.rmse_ns_day.toFixed(3)} ns/day)`;
+
+            return `
+            <tr>
+                <td>${gpuName}</td>
+                <td>${f_ref} MHz</td>
+                <td>${(params.perf_max * atoms).toExponential(2)}</td>
+                <td style="white-space: pre-line; font-family: monospace;">${phiFormula}</td>
+            </tr>
+            `;
+        }).join("");
+    } else {
+        tableHeader = `
+            <tr>
+                <th>GPU</th>
+                <th>f_base (MHz)</th>
+                <th>Performance Model P(f_GPU) = P_base * (f_GPU / f_base)</th>
+            </tr>
+        `;
+
+        rows = GPU_data.map(gpu => {
+            const f_ref = GPU_F_REF[gpu.name] ?? "N/A";
+            const perfRef = gpu.perf ? gpu.perf : "N/A";
+
+            if (!perfRef || Object.keys(perfRef).length === 0) {
+                return `
+                <tr>
+                    <td>${gpu.name}</td>
+                    <td>${f_ref} MHz</td>
+                    <td>No performance data available</td>
+                </tr>
+                `;
+            }
+
+            const firstWorkload = Object.keys(perfRef)[0];
+            const firstBenchmark = Object.keys(perfRef[firstWorkload])[0];
+            const basePerf = perfRef[firstWorkload][firstBenchmark];
+            const perfFormula = `P(f_GPU) = ${basePerf} * (f_GPU / ${f_ref})`;
+
+            return `
+            <tr>
+                <td>${gpu.name}</td>
+                <td>${f_ref} MHz</td>
+                <td style="white-space: pre-line; font-family: monospace;">${perfFormula}</td>
+            </tr>
+            `;
+        }).join("");
+    }
+
+    const modal = document.createElement("div");
+    modal.style.position = "fixed";
+    modal.style.top = "5%";
+    modal.style.left = "5%";
+    modal.style.width = "90%";
+    modal.style.height = "90%";
+    modal.style.backgroundColor = "white";
+    modal.style.color = "#000";
+    modal.style.border = "2px solid #333";
+    modal.style.padding = "20px";
+    modal.style.zIndex = 1000;
+    modal.style.overflowY = "auto";
+    modal.innerHTML = `
+        <h2 style="color: #000;">GPU Performance Model (${workload})</h2>
+        <table style="width:100%; border-collapse: collapse;" border="1">
+            <thead>
+                ${tableHeader}
+            </thead>
+            <tbody>
+                ${rows}
+            </tbody>
+        </table>
+        <br>
+    `;
+
+    const closeBtn = document.createElement("button");
+    closeBtn.textContent = "Close";
+    closeBtn.addEventListener("click", () => {
+        document.body.removeChild(modal);
+    });
+
+    modal.appendChild(closeBtn);
+    document.body.appendChild(modal);
+}
+
+function showPerfPlotsAllBenchmarks() {
+    const container = document.getElementById("perfPlotContainer");
+    if (!container) {
+        console.error("perfPlotContainer not found in DOM");
+        return;
+    }
+
+    // Destroy previous Chart.js instances before clearing container
+    perfPlotChartInstances.forEach(chart => chart.destroy());
+    perfPlotChartInstances = [];
+
+    container.innerHTML = "";
+    container.style.display = "flex";
+    container.style.flexWrap = "wrap";
+    container.style.gap = "20px";
+    container.style.justifyContent = "center";
+
+    const workload = document.getElementById("workload").value;
+    const fittedGpuNames = Object.keys(PERF_DVFS_PARAMS).filter(
+        gpuName => PERF_DVFS_PARAMS[gpuName]?.[workload] && Object.keys(PERF_DVFS_PARAMS[gpuName][workload]).length > 0
+    );
+    const useFittedModel = fittedGpuNames.length > 0;
+
+    const benchmarkIds = useFittedModel
+        ? Object.keys(PERF_BENCHMARK_META[workload] || PERF_DVFS_PARAMS[fittedGpuNames[0]][workload])
+            .map(Number)
+            .sort((a, b) => a - b)
+        : Object.keys(GPU_data[0].perf[workload]);
+
+    benchmarkIds.forEach(benchmarkId => {
+        const plotWrapper = document.createElement("div");
+        plotWrapper.style.width = "420px";
+        plotWrapper.style.height = "340px";
+        plotWrapper.style.border = "1px solid #ccc";
+        plotWrapper.style.padding = "10px";
+        plotWrapper.style.background = "#fafafa";
+        plotWrapper.style.color = "#000";
+
+        const title = document.createElement("h4");
+        title.textContent = `Performance Model – ${workload}, Benchmark ${benchmarkId}`;
+        title.style.textAlign = "center";
+        title.style.color = "#000";
+
+        const canvas = document.createElement("canvas");
+        canvas.height = 300;
+        canvas.style.height = "380px";
+
+        plotWrapper.appendChild(title);
+        plotWrapper.appendChild(canvas);
+        container.appendChild(plotWrapper);
+
+        const ctx = canvas.getContext("2d");
+        const datasets = [];
+        const step = 15;
+        let xMin = useFittedModel ? 210 : 0;
+        let xMax = 0;
+
+        if (useFittedModel) {
+            fittedGpuNames.forEach(gpuName => {
+                const perfParams = PERF_DVFS_PARAMS[gpuName]?.[workload]?.[benchmarkId];
+                if (!perfParams) return;
+
+                const bounds = PERF_GPU_FREQ_BOUNDS[gpuName] || { min: 210, max: GPU_F_REF[gpuName] || 1980 };
+                const points = [];
+
+                for (let f = bounds.min; f <= bounds.max; f += step) {
+                    const perf = computeGpuPerfDVFS(gpuName, null, f, workload, benchmarkId, { asWorkNormalized: true });
+                    points.push({ x: f, y: perf });
+                }
+                if ((bounds.max - bounds.min) % step !== 0) {
+                    const perf = computeGpuPerfDVFS(gpuName, null, bounds.max, workload, benchmarkId, { asWorkNormalized: true });
+                    points.push({ x: bounds.max, y: perf });
+                }
+
+                if (bounds.min < xMin) xMin = bounds.min;
+                if (bounds.max > xMax) xMax = bounds.max;
+
+                datasets.push({
+                    label: gpuName,
+                    data: points,
+                    fill: false,
+                    tension: 0.15,
+                    borderWidth: 1.5,
+                    pointRadius: 1
+                });
+            });
+        } else {
+            GPU_data.forEach(gpu => {
+                const f_ref = GPU_F_REF[gpu.name];
+                const basePerf = gpu.perf?.[workload]?.[benchmarkId];
+                if (!f_ref || !basePerf) return;
+
+                const maxF = Math.round(f_ref * 1.2);
+                const points = [];
+                for (let f = 0; f <= maxF; f += step) {
+                    points.push({ x: f, y: basePerf * (f / f_ref) });
+                }
+                if (maxF > xMax) xMax = maxF;
+
+                datasets.push({
+                    label: gpu.name,
+                    data: points,
+                    fill: false,
+                    tension: 0.15,
+                    borderWidth: 1.5,
+                    pointRadius: 1
+                });
+            });
+        }
+
+        const chart = new Chart(ctx, {
+            type: "line",
+            data: { datasets },
+            options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                layout: { padding: { bottom: 50 } },
+                plugins: {
+                    legend: { position: "top" },
+                    tooltip: {
+                        callbacks: {
+                            label: context => {
+                                return `${context.dataset.label}: ${context.parsed.y.toExponential(2)} ns/day × atoms @ ${context.parsed.x} MHz`;
+                            }
+                        }
+                    }
+                },
+                scales: {
+                    x: {
+                        type: "linear",
+                        min: xMin,
+                        max: xMax || undefined,
+                        title: { display: true, text: "GPU Graphics Frequency (MHz)" },
+                        ticks: { maxRotation: 0, autoSkip: true, maxTicksLimit: 6 }
+                    },
+                    y: {
+                        min: 0,
+                        title: {
+                            display: true,
+                            text: "Performance P(f_GPU) (ns/day × atoms)"
+                        }
+                    }
+                }
+            }
+        });
+
+        perfPlotChartInstances.push(chart);
+    });
+}
+
+function initPerfModelAndPlotButtons() {
+    const perfModelBtn = document.getElementById("showPerfModelBtn");
+    if (perfModelBtn) perfModelBtn.addEventListener("click", showPerfModel);
+
+    const perfPlotBtn = document.getElementById("showPerfPlotBtn");
+    if (perfPlotBtn) perfPlotBtn.addEventListener("click", showPerfPlotsAllBenchmarks);
+}
+
+if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", initPerfModelAndPlotButtons);
+} else {
+    initPerfModelAndPlotButtons();
 }
 
 
@@ -1638,181 +1955,7 @@ function initSliderToggle() {
 window.addEventListener('DOMContentLoaded', initSliderToggle);
 
 
-// ---------- Show Performance Model ----------
-document.getElementById("showPerfModelBtn").addEventListener("click", () => {
-    showPerfModel();
-});
-
-function showPerfModel() {
-    const rows = GPU_data.map(gpu => {
-        const f_ref = GPU_F_REF[gpu.name] ?? "N/A";
-        const perfRef = gpu.perf ? gpu.perf : "N/A";
-
-        if (!perfRef || Object.keys(perfRef).length === 0) {
-            return `
-            <tr>
-                <td>${gpu.name}</td>
-                <td>${f_ref} MHz</td>
-                <td>No performance data available</td>
-            </tr>
-            `;
-        }
-
-        // Take the first workload & benchmark for display
-        const firstWorkload = Object.keys(perfRef)[0];
-        const firstBenchmark = Object.keys(perfRef[firstWorkload])[0];
-        const basePerf = perfRef[firstWorkload][firstBenchmark];
-
-        const perfFormula = `P(f_GPU) = ${basePerf} * (f_GPU / ${f_ref})`;
-
-        return `
-        <tr>
-            <td>${gpu.name}</td>
-            <td>${f_ref} MHz</td>
-            <td style="white-space: pre-line; font-family: monospace;">${perfFormula}</td>
-        </tr>
-        `;
-    }).join("");
-
-    // Create modal
-    const modal = document.createElement("div");
-    modal.style.position = "fixed";
-    modal.style.top = "5%";
-    modal.style.left = "5%";
-    modal.style.width = "90%";
-    modal.style.height = "90%";
-    modal.style.backgroundColor = "white";
-    modal.style.border = "2px solid #333";
-    modal.style.padding = "20px";
-    modal.style.zIndex = 1000;
-    modal.style.overflowY = "auto";
-    modal.innerHTML = `
-        <h2>GPU Performance Model</h2>
-        <table style="width:100%; border-collapse: collapse;" border="1">
-            <thead>
-                <tr>
-                    <th>GPU</th>
-                    <th>f_base (MHz)</th>
-                    <th>Performance Model P(f_GPU) P_base * (f_GPU / f_base);</th>
-                </tr>
-            </thead>
-            <tbody>
-                ${rows}
-            </tbody>
-        </table>
-        <br>
-        <button id="closeModalPerfBtn">Close</button>
-    `;
-
-    document.body.appendChild(modal);
-
-    // Close modal
-    document.getElementById("closeModalPerfBtn").addEventListener("click", () => {
-        document.body.removeChild(modal);
-    });
-}
-
-// ---------- Show Power Plots (All Benchmarks, All GPUs) ----------
-document.getElementById("showPerfPlotBtn").addEventListener("click", () => {
-    showPerfPlotsAllBenchmarks();
-});
-
-function showPerfPlotsAllBenchmarks() {
-    const container = document.getElementById("perfPlotContainer");
-    if (!container) {
-        console.error("perfPlotContainer not found in DOM");
-        return;
-    }
-
-    container.innerHTML = "";
-    container.style.display = "flex";
-    container.style.flexWrap = "wrap";
-    container.style.gap = "20px";
-    container.style.justifyContent = "center";
-
-    const workload = document.getElementById("workload").value;
-
-    const benchmarkIds = Object.keys(GPU_data[0].perf[workload]);
-
-    benchmarkIds.forEach(benchmarkId => {
-        const plotWrapper = document.createElement("div");
-        plotWrapper.style.width = "420px";
-        plotWrapper.style.height = "320px";
-        plotWrapper.style.border = "1px solid #ccc";
-        plotWrapper.style.padding = "10px";
-        plotWrapper.style.background = "#fafafa";
-
-        const title = document.createElement("h4");
-        title.textContent = `Performance Model – ${workload}, Benchmark ${benchmarkId}`;
-        title.style.textAlign = "center";
-
-        const canvas = document.createElement("canvas");
-        canvas.height = 300;
-        canvas.style.height = "380px";
-
-        plotWrapper.appendChild(title);
-        plotWrapper.appendChild(canvas);
-        container.appendChild(plotWrapper);
-
-        const ctx = canvas.getContext("2d");
-
-        let labels = null;
-        const datasets = [];
-
-        GPU_data.forEach(gpu => {
-            const f_ref = GPU_F_REF[gpu.name];
-            const basePerf = gpu.perf?.[workload]?.[benchmarkId];
-            if (!f_ref || !basePerf) return;
-
-            const freqs = [];
-            const perfs = [];
-
-            const maxF = f_ref * 1.2;
-            const step = 15;
-
-            for (let f = 0; f <= maxF; f += step) {
-                freqs.push(Math.round(f));
-                const perf = basePerf * (f / f_ref);
-                perfs.push(perf);
-            }
-
-            if (!labels) labels = freqs;
-
-            datasets.push({
-                label: gpu.name,
-                data: perfs,
-                fill: false,
-                tension: 0.15,
-                borderWidth: 1.5,
-                pointRadius: 1
-            });
-        });
-
-        new Chart(ctx, {
-            type: "line",
-            data: {
-                labels,
-                datasets
-            },
-            options: {
-                responsive: true,
-                maintainAspectRatio: false,
-                layout: { padding: { bottom: 50 } },
-                plugins: { legend: { position: "top" } },
-                scales: {
-                    x: { 
-                        title: { display: true, text: "GPU Graphics Frequency (MHz)" },
-                        ticks: { maxRotation: 0, autoSkip: true, maxTicksLimit: 6 }
-                    },
-                    y: {
-                        min: 0,
-                        title: { display: true, text: "Performance P(f_GPU)" }
-                    }
-                }
-            }
-        });
-    });
-}
+// (showPerfModel and showPerfPlotsAllBenchmarks moved to module scope to prevent duplicate listeners on recalculate)
 
 // ---------- Show Power Model ----------
 document.getElementById("showPowerModelBtn").addEventListener("click", () => {
@@ -1932,10 +2075,12 @@ function showPowerPlotsAllBenchmarks() {
     plotWrapper.style.border = "1px solid #ccc";
     plotWrapper.style.padding = "10px";
     plotWrapper.style.background = "#fafafa";
+    plotWrapper.style.color = "#000";
 
     const title = document.createElement("h4");
     title.textContent = `DVFS Power Model – ${workload}, Benchmark ${benchmarkId}`;
     title.style.textAlign = "center";
+    title.style.color = "#000";
 
     const canvas = document.createElement("canvas");
     canvas.height = 300;
@@ -2167,25 +2312,52 @@ const safeMakePlainArray = arr => arr && arr.length ? arr.map(row => Array.from(
 const allElasticities = {};
 const sobolIndicesOptimized = {};
 const monteCarloParamResults = {};
+const activeUncertainty = getActiveUncertaintyVector();
+
+// Precompute loop-invariant GPU parameters once per GPU (avoids DOM queries & redundant math in hot loops)
+const gpuEvalContext = window.results.map(r => {
+    const gpu = GPU_data[r.originalGPUIndex];
+    if (!gpu) return null;
+
+    const n_gpu = r.n_gpu;
+    const n_nodes = n_gpu / gpu.per_node;
+    const gpuFreq = getEffectiveGPUFreq(gpu);
+    const power = computeGpuPowerDVFS(gpu, gpu.power[workload][benchmarkId], gpuFreq, workload, benchmarkId);
+    const basePerf = gpu.perf[workload][benchmarkId];
+    const perf = basePerf * (gpuFreq / gpu.f_ref);
+    const total_perf = perf * n_gpu;
+    const total_power = power * n_gpu;
+    const eta_multiGPU = multiGpuEfficiency(n_gpu, gpu.per_node);
+
+    const base = [
+        gpu.cost, C_node_server, C_node_infra, C_node_facility, C_software,
+        C_electricity, C_heatreuseperkWh, PUE, C_maintenance, system_usage,
+        lifetime, W_node_baseline, C_depreciation, C_subscription, C_uefficiency
+    ];
+    const normBase = new Float64Array(base.map(v => v === 0 ? 0.001 : v));
+
+    return {
+        gpu,
+        n_gpu,
+        n_nodes,
+        power,
+        perf,
+        total_perf,
+        total_power,
+        eta_multiGPU,
+        base,
+        normBase
+    };
+});
 
 ACTIVE_METRICS.forEach(metric => {
     // Elasticity
     const elasticities = window.results.map((r, i) => {
-        const gpu = GPU_data[r.originalGPUIndex];
-        if (!gpu) return null;
+        const ctx = gpuEvalContext[i];
+        if (!ctx) return null;
 
-        const n_gpu = r.n_gpu;
-        const n_nodes = n_gpu / gpu.per_node;
-        //const perf = gpu.perf[workload][benchmarkId];
-        //const power = gpu.power[workload][benchmarkId];
-		const gpuFreq = getEffectiveGPUFreq(gpu);  
-  		const power = computeGpuPowerDVFS(gpu, gpu.power[workload][benchmarkId], gpuFreq, workload, benchmarkId);
-  		const basePerf = gpu.perf[workload][benchmarkId];
-  		const perf = basePerf * (gpuFreq / gpu.f_ref);
-        const total_perf = perf * n_gpu;
-        const total_power = power * n_gpu;
-		const eta_multiGPU = multiGpuEfficiency(n_gpu, gpu.per_node);
-  		const total_work = total_perf * eta_multiGPU * system_usage * lifetime / 24;
+        const { n_gpu, n_nodes, power, total_perf, total_power, eta_multiGPU, base: baseValues } = ctx;
+        const total_work = total_perf * eta_multiGPU * system_usage * lifetime / 24;
         const W_gpu_total = (power * system_usage * lifetime * n_gpu) / 1000;
         const W_node_total = (W_node_baseline * system_usage * lifetime * n_nodes) / 1000;
         const TCO = r.total_cost;
@@ -2199,12 +2371,6 @@ ACTIVE_METRICS.forEach(metric => {
             default: metricValue = undefined;
         }
         if (metricValue === undefined || metricValue === 0) return null;
-
-        const baseValues = [
-            gpu.cost, C_node_server, C_node_infra, C_node_facility, C_software,
-            C_electricity, C_heatreuseperkWh, PUE, C_maintenance, system_usage,
-            lifetime, W_node_baseline, C_depreciation, C_subscription, C_uefficiency
-        ];
 
         const dTCO = [
             n_gpu,
@@ -2231,35 +2397,24 @@ ACTIVE_METRICS.forEach(metric => {
 
 // ---------- Shared Cost Evaluation Function ----------
 function evaluateMetric(params, gpuIndex, metricKey) {
-  const r = window.results[gpuIndex];
-  const gpu = GPU_data[r.originalGPUIndex];
+  const ctx = gpuEvalContext[gpuIndex];
+  const { n_gpu, n_nodes, power, total_perf, total_power, eta_multiGPU } = ctx;
 
-  const n_gpu = r.n_gpu;
-  const n_nodes = n_gpu / gpu.per_node;
-  //const perf = gpu.perf[workload][benchmarkId];
-  //const power = gpu.power[workload][benchmarkId];
-  const gpuFreq = getEffectiveGPUFreq(gpu);  
-  const power = computeGpuPowerDVFS(gpu, gpu.power[workload][benchmarkId], gpuFreq, workload, benchmarkId);
-  const basePerf = gpu.perf[workload][benchmarkId];
-  const perf = basePerf * (gpuFreq / gpu.f_ref);
-
-  const [
-    C_gpu,
-    C_node_server,
-    C_node_infra,
-    C_node_facility,
-    C_software,
-    C_electricity,
-    C_heatreuseperkWh,
-    PUE,
-    C_maintenance,
-    system_usage,
-    lifetime,
-    W_node_baseline,
-    C_depreciation,
-    C_subscription,
-    C_uefficiency
-  ] = params;
+  const C_gpu = params[0];
+  const C_node_server = params[1];
+  const C_node_infra = params[2];
+  const C_node_facility = params[3];
+  const C_software = params[4];
+  const C_electricity = params[5];
+  const C_heatreuseperkWh = params[6];
+  const PUE = params[7];
+  const C_maintenance = params[8];
+  const system_usage = params[9];
+  const lifetime = params[10];
+  const W_node_baseline = params[11];
+  const C_depreciation = params[12];
+  const C_subscription = params[13];
+  const C_uefficiency = params[14];
 
   const W_gpu_total = power * system_usage * lifetime;
   const W_node_total = W_node_baseline * system_usage * lifetime;
@@ -2274,9 +2429,6 @@ function evaluateMetric(params, gpuIndex, metricKey) {
     n_nodes * C_maintenance * lifetime +
     lifetime * (C_depreciation + C_subscription + C_uefficiency);
 
-  const total_perf = perf * n_gpu;
-  const total_power = power * n_gpu;
-  const eta_multiGPU = multiGpuEfficiency(n_gpu, gpu.per_node);
   const total_work = total_perf * eta_multiGPU * system_usage * lifetime / 24;	
 
   switch (metricKey) {
@@ -2295,120 +2447,141 @@ function evaluateMetric(params, gpuIndex, metricKey) {
 
 // ---------- Sobol Total-Order Sensitivity (robust) ----------
 function computeTotalOrderSobolNormalized(numSamples = 2000, metric) {
-  const numGPUs = window.results.length;
-  const numParams = 15;
-  const sobolResults = new Array(numGPUs);
-  const activeUncertainty = getActiveUncertaintyVector();
+  const numGPUs = window.results.length;
+  const numParams = 15;
+  const sobolResults = new Array(numGPUs);
 
-function generatePerturbations(N, k, ranges) {
-  const p = new Float64Array(N * k);
-  for (let i = 0; i < N; i++) {
-    for (let j = 0; j < k; j++) {
-      const r = ranges[j];
-      p[i * k + j] = (Math.random() - 0.5) * 2 * r; // uniform [0,1] shifts to [-0.5, 0.5] and then scales to [-r, r], i.e., ±r*100%
-    }
-  }
-  return p;
-}
+  function generatePerturbations(N, k, ranges) {
+    const p = new Float64Array(N * k);
+    for (let i = 0; i < N; i++) {
+      for (let j = 0; j < k; j++) {
+        const r = ranges[j];
+        p[i * k + j] = (Math.random() - 0.5) * 2 * r; // uniform [0,1] shifts to [-0.5, 0.5] and then scales to [-r, r], i.e., ±r*100%
+      }
+    }
+    return p;
+  }
 
-  for (let g = 0; g < numGPUs; g++) {
-    const gpu = GPU_data[window.results[g].originalGPUIndex];
-    const base = [
-      gpu.cost, C_node_server, C_node_infra, C_node_facility, C_software,
-      C_electricity, C_heatreuseperkWh, PUE, C_maintenance, system_usage,
-      lifetime, W_node_baseline, C_depreciation, C_subscription, C_uefficiency
-    ];
+  for (let g = 0; g < numGPUs; g++) {
+    const ctx = gpuEvalContext[g];
+    if (!ctx) {
+      sobolResults[g] = new Array(numParams).fill(0);
+      continue;
+    }
+    const { normBase } = ctx;
 
-    // Normalize to ~1
-    const normBase = base.map(v => v === 0 ? 0.001 : v); // numerical safeguard only: Zero baselines are replaced with a small value 0.001 to prevent zero variance, which would otherwise make Sobol indices meaningless and the Monte Carlo standard deviation zero.
+    const perturbA = generatePerturbations(numSamples, numParams, activeUncertainty);
+    const perturbB = generatePerturbations(numSamples, numParams, activeUncertainty);
 
-	const perturbA = generatePerturbations(numSamples, numParams, activeUncertainty);
-	const perturbB = generatePerturbations(numSamples, numParams, activeUncertainty);
+    const A = new Array(numSamples);
+    const B = new Array(numSamples);
+    const Y_A = new Float64Array(numSamples);
+    let hasInvalid = false;
+    let sumYA = 0;
 
-    const A = [], B = [];
+    for (let i = 0; i < numSamples; i++) {
+      const rowA = new Float64Array(numParams);
+      const rowB = new Float64Array(numParams);
+      const offset = i * numParams;
+      for (let j = 0; j < numParams; j++) {
+        const baseVal = normBase[j];
+        rowA[j] = baseVal * (1 + perturbA[offset + j]);
+        rowB[j] = baseVal * (1 + perturbB[offset + j]);
+      }
+      A[i] = rowA;
+      B[i] = rowB;
 
-    for (let i = 0; i < numSamples; i++) {
-      const rowA = new Float64Array(numParams);
-      const rowB = new Float64Array(numParams);
-      for (let j = 0; j < numParams; j++) {
-        rowA[j] = normBase[j] * (1 + perturbA[i * numParams + j]);
-        rowB[j] = normBase[j] * (1 + perturbB[i * numParams + j]);
-      }
-      A.push(rowA);
-      B.push(rowB);
-    }
-
-    const Y_A = A.map(a => evaluateMetric(a, g, metric)); 
-    
-    // Check if any metric evaluation is invalid (e.g., division by zero leading to Infinity/NaN)
-    if (Y_A.some(v => !isFinite(v))) {
-        sobolResults[g] = Array.from(new Float64Array(numParams).fill(0));
-        continue;
+      const y = evaluateMetric(rowA, g, metric);
+      if (!isFinite(y)) hasInvalid = true;
+      Y_A[i] = y;
+      sumYA += y;
     }
 
-    const meanYA = Y_A.reduce((a, b) => a + b, 0) / numSamples;
-    const varY = Y_A.reduce((s, y) => s + (y - meanYA) ** 2, 0) / (numSamples - 1);
-    
+    // Check if any metric evaluation is invalid (e.g., division by zero leading to Infinity/NaN)
+    if (hasInvalid) {
+      sobolResults[g] = new Array(numParams).fill(0);
+      continue;
+    }
+
+    const meanYA = sumYA / numSamples;
+    let varSum = 0;
+    for (let i = 0; i < numSamples; i++) {
+      const d = Y_A[i] - meanYA;
+      varSum += d * d;
+    }
+    const varY = varSum / (numSamples - 1);
+
     // ✅ CRITICAL FIX: Check for negligible variance (division by zero trap)
-    if (!isFinite(varY) || varY <= 1e-15) { // Relaxed tolerance to 1e-15
-      sobolResults[g] = Array.from(new Float64Array(numParams).fill(0));
-      continue;
-    }
-    
-    // Note: The redundant `if (!isFinite(varY) || varY <= 1e-12)` block below the mean/var calculation was removed.
-    
-    const S_T = new Float64Array(numParams);
+    if (!isFinite(varY) || varY <= 1e-15) { // Relaxed tolerance to 1e-15
+      sobolResults[g] = new Array(numParams).fill(0);
+      continue;
+    }
 
-    for (let j = 0; j < numParams; j++) {
-      let sumSqDiff = 0;
-      for (let i = 0; i < numSamples; i++) {
-        const hybrid = new Float64Array(A[i]);
-        hybrid[j] = B[i][j];
-        sumSqDiff += (Y_A[i] - evaluateMetric(hybrid, g, metric)) ** 2;
-      }
-      
+    const S_T = new Float64Array(numParams);
+
+    for (let j = 0; j < numParams; j++) {
+      let sumSqDiff = 0;
+      for (let i = 0; i < numSamples; i++) {
+        const rowA = A[i];
+        const orig = rowA[j];
+        rowA[j] = B[i][j];
+        const yHybrid = evaluateMetric(rowA, g, metric);
+        rowA[j] = orig;
+        const diff = Y_A[i] - yHybrid;
+        sumSqDiff += diff * diff;
+      }
+
       // Calculate Sobol index only if sumSqDiff is finite (preventing secondary NaN)
-      if (isFinite(sumSqDiff)) {
-        S_T[j] = 100 * (sumSqDiff / (2 * varY * numSamples)); 
-      } else {
-        S_T[j] = 0;
-      }
-    }
+      if (isFinite(sumSqDiff)) {
+        S_T[j] = 100 * (sumSqDiff / (2 * varY * numSamples));
+      } else {
+        S_T[j] = 0;
+      }
+    }
 
-    // ✅ Final fix: Ensure the raw Sobol index array is a plain array for other functions to process.
-    sobolResults[g] = Array.from(S_T);
-  }
+    // ✅ Final fix: Ensure the raw Sobol index array is a plain array for other functions to process.
+    sobolResults[g] = Array.from(S_T);
+  }
 
-  return sobolResults;
+  return sobolResults;
 }
 
 // ---------- Monte Carlo (% std / base cost) ----------
 function monteCarloUncertaintyNormalized(numSamples = 1000, metric, perturbation = 0.2) {
   const results = [];
   const numParams = 15;
-  const activeUncertainty = getActiveUncertaintyVector();
+  const samples = new Float64Array(numSamples);
 
   for (let i = 0; i < window.results.length; i++) {
-    const gpu = GPU_data[window.results[i].originalGPUIndex];
-    const base = [
-      gpu.cost, C_node_server, C_node_infra, C_node_facility, C_software,
-      C_electricity, C_heatreuseperkWh, PUE, C_maintenance, system_usage,
-      lifetime, W_node_baseline, C_depreciation, C_subscription, C_uefficiency
-    ];
-
-    const normBase = base.map(v => v === 0 ? 0.001 : v); // numerical safeguard only: zero baselines are replaced with a small value 0.001 to prevent zero variance, which would otherwise make Sobol indices meaningless and the Monte Carlo standard deviation zero.
+    const ctx = gpuEvalContext[i];
+    if (!ctx) {
+      results.push(new Array(numParams).fill(0));
+      continue;
+    }
+    const { normBase } = ctx;
     const baseMetric = evaluateMetric(normBase, i, metric);
     const stds = new Float64Array(numParams);
+    const params = new Float64Array(normBase);
 
     for (let j = 0; j < numParams; j++) {
-      const samples = new Float64Array(numSamples);
+      const baseVal = normBase[j];
+      const range = activeUncertainty[j];
+      let sum = 0;
       for (let k = 0; k < numSamples; k++) {
-        const params = [...normBase];
-		params[j] *= 1 + (Math.random() - 0.5) * 2 * activeUncertainty[j];
-        samples[k] = evaluateMetric(params, i, metric);
+        params[j] = baseVal * (1 + (Math.random() - 0.5) * 2 * range);
+        const val = evaluateMetric(params, i, metric);
+        samples[k] = val;
+        sum += val;
       }
-      const mean = samples.reduce((s, v) => s + v, 0) / numSamples;
-      const variance = samples.reduce((s, v) => s + (v - mean) ** 2, 0) / (numSamples - 1);
+      params[j] = baseVal;
+
+      const mean = sum / numSamples;
+      let sqDiffSum = 0;
+      for (let k = 0; k < numSamples; k++) {
+        const d = samples[k] - mean;
+        sqDiffSum += d * d;
+      }
+      const variance = sqDiffSum / (numSamples - 1);
       stds[j] = 100 * (Math.sqrt(variance) / Math.abs(baseMetric));
     }
 
@@ -2628,10 +2801,6 @@ window.renderTornadoPlots = function renderTornadoPlots(metric) {
   tornadoContainer.innerHTML = "";
 
   window.results.forEach((gpu, i) => {
-  const tornadoContainer = document.getElementById("gpuTornadoPlots");
-  tornadoContainer.innerHTML = "";
-
-  window.results.forEach((gpu, i) => {
     const gpuName = gpu.name;
 
     // ✅ RAW (not normalized)
@@ -2683,7 +2852,6 @@ window.renderTornadoPlots = function renderTornadoPlots(metric) {
 
     Plotly.newPlot(chartDiv, [traceElasticity, traceSobol, traceMC], layout);
   });
-});
 };
 	
 renderTornadoPlots("tco");
