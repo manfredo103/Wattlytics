@@ -191,67 +191,97 @@ function compareOldAndNewPrices() {
 }
 
 let chartInstance;  // Global to allow destroy and reset zoom
+let cachedPriceHistoryData = null;
 
-async function loadPriceHistory(metric = 'percentDiff') {
-  try {
-    const response = await fetch('/.netlify/functions/price-history');
-    if (!response.ok) {
-      const text = await response.text();
-      throw new Error(`Error fetching price history: ${response.statusText} - ${text}`);
-    }
+async function fetchPriceHistoryData(forceRefresh = false) {
+  if (!forceRefresh && cachedPriceHistoryData) {
+    return cachedPriceHistoryData;
+  }
 
-    const data = await response.json();
+  const response = await fetch('/.netlify/functions/price-history');
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(`Error fetching price history: ${response.statusText} - ${text}`);
+  }
 
-    const gpuList = ['H100', 'GH200', 'A100', 'A40', 'L4', 'L40', 'L40S'];
+  const rawData = await response.json();
+  const gpuList = ['H100', 'GH200', 'A100', 'A40', 'L4', 'L40', 'L40S'];
+  const grouped = {};
+  const byGpuAndTs = {};
+  const uniqueTsSet = new Set();
 
-    // Group data by GPU
-    const grouped = {};
-    gpuList.forEach(gpu => {
-      grouped[gpu] = data
-        .filter(item => item.gpu === gpu)
-        .sort((a, b) => new Date(a.date) - new Date(b.date));
-    });
+  gpuList.forEach(gpu => {
+    grouped[gpu] = [];
+    byGpuAndTs[gpu] = new Map();
+  });
 
-    // Use Date objects for labels (for time scale)
-    const labels = [...new Set(data.map(item => new Date(item.date)))].sort((a, b) => a - b);
-
-    // Main datasets (one line per GPU)
-    const datasets = gpuList.map((gpu, index) => ({
-      label: gpu,
-      data: labels.map(date => {
-        const entry = grouped[gpu].find(e => new Date(e.date).getTime() === date.getTime());
-        return entry ? (metric === 'percentDiff' ? entry.percentDiff : entry.livePrice) : null;
-      }),
-      borderColor: getColor(index),
-      backgroundColor: getColor(index, 0.2),
-      fill: metric === 'livePrice' ? true : false,
-      tension: 0.3,
-      pointRadius: 4
-    }));
-
-    // Collect all peak jumps into one dataset
-const peakJumpPoints = [];
-
-gpuList.forEach((gpu, index) => {
-  const gpuData = grouped[gpu];
-  if (gpuData.length < 2) return;
-
-  let maxJump = { diff: 0, entry: null };
-  for (let i = 1; i < gpuData.length; i++) {
-    const prevVal = metric === 'percentDiff' ? gpuData[i-1].percentDiff : gpuData[i-1].livePrice;
-    const currVal = metric === 'percentDiff' ? gpuData[i].percentDiff : gpuData[i].livePrice;
-    const jump = Math.abs(currVal - prevVal);
-    if (jump > maxJump.diff) {
-      maxJump = { diff: jump, entry: gpuData[i] };
+  for (const item of rawData) {
+    const ts = Date.parse(item.date);
+    if (!Number.isFinite(ts)) continue;
+    uniqueTsSet.add(ts);
+    if (grouped[item.gpu]) {
+      const entry = { ...item, ts };
+      grouped[item.gpu].push(entry);
+      byGpuAndTs[item.gpu].set(ts, entry);
     }
   }
-  if (!maxJump.entry) return;
 
-  peakJumpPoints.push({
-    x: new Date(maxJump.entry.date),
-    y: metric === 'percentDiff' ? maxJump.entry.percentDiff : maxJump.entry.livePrice,
+  gpuList.forEach(gpu => {
+    grouped[gpu].sort((a, b) => a.ts - b.ts);
   });
-});
+
+  const sortedTimestamps = Array.from(uniqueTsSet).sort((a, b) => a - b);
+  const labels = sortedTimestamps.map(ts => new Date(ts));
+
+  cachedPriceHistoryData = { gpuList, grouped, byGpuAndTs, sortedTimestamps, labels };
+  return cachedPriceHistoryData;
+}
+
+async function loadPriceHistory(metric = 'percentDiff', forceRefresh = false) {
+  try {
+    const { gpuList, grouped, byGpuAndTs, sortedTimestamps, labels } =
+      await fetchPriceHistoryData(forceRefresh);
+
+    // Main datasets (one line per GPU) using O(1) timestamp map lookup
+    const datasets = gpuList.map((gpu, index) => {
+      const tsMap = byGpuAndTs[gpu];
+      return {
+        label: gpu,
+        data: sortedTimestamps.map(ts => {
+          const entry = tsMap.get(ts);
+          return entry ? (metric === 'percentDiff' ? entry.percentDiff : entry.livePrice) : null;
+        }),
+        borderColor: getColor(index),
+        backgroundColor: getColor(index, 0.2),
+        fill: metric === 'livePrice' ? true : false,
+        tension: 0.3,
+        pointRadius: 4
+      };
+    });
+
+    // Collect all peak jumps into one dataset
+    const peakJumpPoints = [];
+
+    gpuList.forEach(gpu => {
+      const gpuData = grouped[gpu];
+      if (gpuData.length < 2) return;
+
+      let maxJump = { diff: 0, entry: null };
+      for (let i = 1; i < gpuData.length; i++) {
+        const prevVal = metric === 'percentDiff' ? gpuData[i - 1].percentDiff : gpuData[i - 1].livePrice;
+        const currVal = metric === 'percentDiff' ? gpuData[i].percentDiff : gpuData[i].livePrice;
+        const jump = Math.abs(currVal - prevVal);
+        if (jump > maxJump.diff) {
+          maxJump = { diff: jump, entry: gpuData[i] };
+        }
+      }
+      if (!maxJump.entry) return;
+
+      peakJumpPoints.push({
+        x: new Date(maxJump.entry.ts),
+        y: metric === 'percentDiff' ? maxJump.entry.percentDiff : maxJump.entry.livePrice,
+      });
+    });
 
 if (peakJumpPoints.length > 0) {
   datasets.push({
@@ -386,9 +416,8 @@ function exportChartImage() {
 
 function exportChartCSV() {
   if (!chartInstance) return;
-  const gpuList = chartInstance.data.datasets
-    .filter(ds => ds.type !== 'scatter')  // Exclude highlight scatter datasets
-    .map(ds => ds.label);
+  const lineDatasets = chartInstance.data.datasets.filter(ds => ds.type !== 'scatter');
+  const gpuList = lineDatasets.map(ds => ds.label);
 
   // Collect unique dates from labels
   const labels = chartInstance.data.labels;
@@ -396,11 +425,9 @@ function exportChartCSV() {
   const csvRows = [];
   csvRows.push(['Date', ...gpuList]);
 
-  labels.forEach(label => {
+  labels.forEach((label, idx) => {
     const row = [label.toISOString().split('T')[0]];
-    gpuList.forEach(gpu => {
-      const dataset = chartInstance.data.datasets.find(ds => ds.label === gpu);
-      const idx = labels.indexOf(label);
+    lineDatasets.forEach(dataset => {
       const value = dataset.data[idx];
       row.push(value !== null && value !== undefined ? value.toFixed(2) : '');
     });
@@ -410,9 +437,11 @@ function exportChartCSV() {
   const csvString = csvRows.map(row => row.join(',')).join('\n');
   const blob = new Blob([csvString], { type: 'text/csv' });
   const link = document.createElement('a');
-  link.href = URL.createObjectURL(blob);
+  const url = URL.createObjectURL(blob);
+  link.href = url;
   link.download = 'gpu_price_history.csv';
   link.click();
+  URL.revokeObjectURL(url);
 }
 
 // Make functions globally accessible
@@ -881,18 +910,390 @@ function showPerfPlotsAllBenchmarks() {
     });
 }
 
-function initPerfModelAndPlotButtons() {
+const ACTIVE_METRICS = ["tco", "perf_per_tco", "power_per_tco", "perf_per_watt_per_tco"];
+const METRIC_TITLES = {
+    tco: "TCO",
+    perf_per_tco: "Work-per-TCO",
+    power_per_tco: "Power-per-TCO",
+    perf_per_watt_per_tco: "Work-per-Watt-per-TCO"
+};
+
+let powerPlotChartInstances = [];
+
+function toggleSliders() {
+    const checkedRadio = document.querySelector('input[name="calculationMode"]:checked');
+    if (!checkedRadio) return;
+
+    const mode = checkedRadio.value;
+    document.querySelectorAll('.mode-slider').forEach(sliderDiv => {
+        sliderDiv.style.display = 'none';
+    });
+
+    const activeSlider = document.getElementById(`slider_${mode}`);
+    if (activeSlider) activeSlider.style.display = 'block';
+}
+
+function initSliderToggle() {
+    toggleSliders();
+    document.querySelectorAll('input[name="calculationMode"]').forEach(el => {
+        el.addEventListener('change', toggleSliders);
+    });
+}
+
+function updateSlidersFromGlobal() {
+    const globalSlider = document.getElementById("globalUncertainty");
+    const globalLockIcon = document.getElementById("globalLockIcon");
+    if (!globalSlider) return;
+
+    const globalVal = parseFloat(globalSlider.value);
+    const isGlobal = globalVal > 0;
+
+    const globalValSpan = document.getElementById("v_globalUncertainty");
+    if (globalValSpan) globalValSpan.innerText = globalVal;
+    if (globalLockIcon) globalLockIcon.style.display = isGlobal ? "inline-block" : "none";
+
+    document.querySelectorAll(".paramUncertainty").forEach(slider => {
+        const span = slider.parentElement.querySelector(".uncValue");
+        if (isGlobal) {
+            slider.disabled = true;
+            slider.value = Math.round(globalVal);
+            if (span) span.innerText = slider.value;
+        } else {
+            slider.disabled = false;
+            if (span) span.innerText = slider.value;
+        }
+    });
+}
+
+function showPowerModel() {
+    const rows = GPU_data.map(gpu => {
+        const f_ref = GPU_F_REF[gpu.name] ?? "N/A";
+        const tdp_ref = GPU_TDP_REF[gpu.name] ?? "N/A";
+        const dvfs = gpu.DVFS_PARAMS;
+
+        if (!dvfs || Object.keys(dvfs).length === 0) {
+            return `
+            <tr>
+                <td>${gpu.name}</td>
+                <td>${f_ref} MHz</td>
+                <td>${tdp_ref} W</td>
+                <td>No DVFS parameters available</td>
+            </tr>
+            `;
+        }
+
+        const firstWorkload = Object.keys(dvfs)[0];
+        const firstBenchmark = Object.keys(dvfs[firstWorkload])[0];
+        const params = dvfs[firstWorkload][firstBenchmark];
+
+        const phiFormula = `
+φ(f_GPU) =
+{
+  ${params.b1} * f_GPU + ${params.c1},          if f_GPU ≤ ${params.f_t} * f_ref
+  ${params.a2} * f_GPU² + ${params.b2} * f_GPU + ${params.c2},  if f_GPU > ${params.f_t} * f_ref
+}`;
+
+        return `
+        <tr>
+            <td>${gpu.name}</td>
+            <td>${f_ref} MHz</td>
+            <td>${tdp_ref} W</td>
+            <td style="white-space: pre-line; font-family: monospace;">${phiFormula}</td>
+        </tr>
+        `;
+    }).join("");
+
+    const modal = document.createElement("div");
+    modal.style.position = "fixed";
+    modal.style.top = "5%";
+    modal.style.left = "5%";
+    modal.style.width = "90%";
+    modal.style.height = "90%";
+    modal.style.backgroundColor = "white";
+    modal.style.color = "#000";
+    modal.style.border = "2px solid #333";
+    modal.style.padding = "20px";
+    modal.style.zIndex = 1000;
+    modal.style.overflowY = "auto";
+    modal.innerHTML = `
+        <h2 style="color: #000;">GPU Power Model</h2>
+        <table style="width:100%; border-collapse: collapse;" border="1">
+            <thead>
+                <tr>
+                    <th>GPU</th>
+                    <th>f_base (MHz)</th>
+                    <th>W_TDP (W)</th>
+                    <th>Power Model W(f_GPU)=min(W_TDP, φ(f_GPU))</th>
+                </tr>
+            </thead>
+            <tbody>
+                ${rows}
+            </tbody>
+        </table>
+        <br>
+    `;
+
+    const closeBtn = document.createElement("button");
+    closeBtn.textContent = "Close";
+    closeBtn.addEventListener("click", () => {
+        document.body.removeChild(modal);
+    });
+
+    modal.appendChild(closeBtn);
+    document.body.appendChild(modal);
+}
+
+function showPowerPlotsAllBenchmarks() {
+    const container = document.getElementById("powerPlotContainer");
+    if (!container) {
+        console.error("powerPlotContainer not found in DOM");
+        return;
+    }
+
+    powerPlotChartInstances.forEach(chart => chart.destroy());
+    powerPlotChartInstances = [];
+
+    container.innerHTML = "";
+    container.style.display = "flex";
+    container.style.flexWrap = "wrap";
+    container.style.gap = "20px";
+    container.style.justifyContent = "center";
+
+    const workload = document.getElementById("workload").value;
+    const benchmarkIds = Object.keys(GPU_data[0].DVFS_PARAMS[workload]);
+
+    benchmarkIds.forEach(benchmarkId => {
+        const plotWrapper = document.createElement("div");
+        plotWrapper.style.width = "420px";
+        plotWrapper.style.height = "320px";
+        plotWrapper.style.border = "1px solid #ccc";
+        plotWrapper.style.padding = "10px";
+        plotWrapper.style.background = "#fafafa";
+        plotWrapper.style.color = "#000";
+
+        const title = document.createElement("h4");
+        title.textContent = `DVFS Power Model – ${workload}, Benchmark ${benchmarkId}`;
+        title.style.textAlign = "center";
+        title.style.color = "#000";
+
+        const canvas = document.createElement("canvas");
+        canvas.height = 300;
+        canvas.style.height = "380px";
+
+        plotWrapper.appendChild(title);
+        plotWrapper.appendChild(canvas);
+        container.appendChild(plotWrapper);
+
+        const ctx = canvas.getContext("2d");
+        let labels = null;
+        const datasets = [];
+
+        GPU_data.forEach(gpu => {
+            const f_ref = GPU_F_REF[gpu.name];
+            const dvfs = gpu.DVFS_PARAMS?.[workload]?.[benchmarkId];
+            if (!f_ref || !dvfs) return;
+
+            const freqs = [];
+            const powers = [];
+            const maxF = f_ref * 1.2;
+            const step = 15;
+
+            for (let f = 0; f <= maxF; f += step) {
+                freqs.push(Math.round(f));
+                const W_TDP = gpu.tdp_ref;
+                if (!W_TDP) return;
+
+                let phi;
+                if (f <= dvfs.f_t) {
+                    phi = dvfs.b1 * f + dvfs.c1;
+                } else {
+                    phi = dvfs.a2 * f * f + dvfs.b2 * f + dvfs.c2;
+                }
+
+                powers.push(Math.min(W_TDP, phi));
+            }
+
+            if (!labels) labels = freqs;
+
+            datasets.push({
+                label: gpu.name,
+                data: powers,
+                fill: false,
+                tension: 0.15,
+                borderWidth: 1.5,
+                pointRadius: 1
+            });
+        });
+
+        const chart = new Chart(ctx, {
+            type: "line",
+            data: { labels, datasets },
+            options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                layout: { padding: { bottom: 50 } },
+                plugins: { legend: { position: "top" } },
+                scales: {
+                    x: {
+                        title: { display: true, text: "GPU Graphics Frequency (MHz)" },
+                        ticks: { maxRotation: 0, autoSkip: true, maxTicksLimit: 6 }
+                    },
+                    y: {
+                        min: 0,
+                        title: { display: true, text: "Power W(f_GPU)=min(W_TDP, φ(f_GPU))" }
+                    }
+                }
+            }
+        });
+
+        powerPlotChartInstances.push(chart);
+    });
+}
+
+function downloadCSV(data, filename) {
+    if (!data) {
+        console.error("No data provided for CSV download.");
+        return;
+    }
+    if (!filename) {
+        console.error("No filename provided.");
+        return;
+    }
+
+    try {
+        const blob = new Blob([data], { type: "text/csv;charset=utf-8;" });
+        const link = document.createElement("a");
+        const url = URL.createObjectURL(blob);
+        link.setAttribute("href", url);
+        link.setAttribute("download", filename);
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
+        URL.revokeObjectURL(url);
+    } catch (error) {
+        console.error("Error while downloading the CSV:", error);
+    }
+}
+
+function downloadCSV2(data, filename = "gpu_tco_results.csv") {
+    if (!Array.isArray(data) || data.length === 0) {
+        console.error("Invalid data: must be a non-empty array.");
+        return;
+    }
+
+    const headers = [
+        "GPU",
+        "#GPUs",
+        "Total Perf (ns/day*atoms)",
+        "Total Power (W)",
+        "TCO (€)",
+        "Work-per-TCO (ns/€ * atoms)",
+        "Power-per-TCO (W/€)",
+        "Work-per-watt-per-TCO (ns/W/€ * atoms)",
+        "Baseline %"
+    ];
+
+    const rows = data.map(r => [
+        r.name,
+        r.n_gpu,
+        r.performance.toFixed(1),
+        r.power.toFixed(1),
+        Math.round(r.total_cost),
+        r.perf_per_tco.toFixed(1),
+        r.power_per_tco.toFixed(1),
+        r.perf_per_watt_per_tco.toFixed(3),
+        r.baseline_pct.toFixed(2)
+    ]);
+
+    const csvContent = [
+        headers.join(","),
+        ...rows.map(row => row.join(","))
+    ].join("\n");
+
+    downloadCSV(csvContent, filename);
+}
+
+function initStaticUIListeners() {
+    initSliderToggle();
+    updateSlidersFromGlobal();
+
     const perfModelBtn = document.getElementById("showPerfModelBtn");
     if (perfModelBtn) perfModelBtn.addEventListener("click", showPerfModel);
 
     const perfPlotBtn = document.getElementById("showPerfPlotBtn");
     if (perfPlotBtn) perfPlotBtn.addEventListener("click", showPerfPlotsAllBenchmarks);
+
+    const powerModelBtn = document.getElementById("showPowerModelBtn");
+    if (powerModelBtn) powerModelBtn.addEventListener("click", showPowerModel);
+
+    const powerPlotBtn = document.getElementById("showPowerPlotBtn");
+    if (powerPlotBtn) powerPlotBtn.addEventListener("click", showPowerPlotsAllBenchmarks);
+
+    const downloadCsvBtn = document.getElementById("download-csv");
+    if (downloadCsvBtn) {
+        downloadCsvBtn.addEventListener("click", () => {
+            downloadCSV2(window.results);
+        });
+    }
+
+    const globalSlider = document.getElementById("globalUncertainty");
+    if (globalSlider) {
+        globalSlider.addEventListener("input", updateSlidersFromGlobal);
+    }
+
+    document.addEventListener("input", e => {
+        if (e.target.classList?.contains("paramUncertainty")) {
+            const span = e.target.parentElement?.querySelector(".uncValue");
+            if (span) span.innerText = e.target.value;
+        }
+    });
+
+    const metricSelector = document.getElementById("metricSelector");
+    if (metricSelector) {
+        if (metricSelector.options.length === 0) {
+            ACTIVE_METRICS.forEach(metric => {
+                const opt = document.createElement("option");
+                opt.value = metric;
+                opt.text = METRIC_TITLES[metric];
+                metricSelector.appendChild(opt);
+            });
+        }
+        metricSelector.addEventListener("change", e => {
+            const metricIdx = ACTIVE_METRICS.indexOf(e.target.value);
+            const visibility = [];
+            for (let i = 0; i < ACTIVE_METRICS.length * 3; i++) {
+                visibility.push(Math.floor(i / 3) === metricIdx);
+            }
+            Plotly.update("sensitivityHeatmaps", { visible: visibility });
+        });
+    }
+
+    const downloadHeatmapBtn = document.getElementById("downloadBtn");
+    if (downloadHeatmapBtn) {
+        downloadHeatmapBtn.addEventListener("click", () => {
+            Plotly.downloadImage(document.getElementById("sensitivityHeatmaps"), {
+                format: 'png',
+                width: 1600,
+                height: 900,
+                filename: 'sensitivity_heatmaps'
+            });
+        });
+    }
+
+    const tornadoMetricSelect = document.getElementById("tornadoMetricSelect");
+    if (tornadoMetricSelect) {
+        tornadoMetricSelect.addEventListener("change", e => {
+            if (typeof window.renderTornadoPlots === "function") {
+                window.renderTornadoPlots(e.target.value);
+            }
+        });
+    }
 }
 
 if (document.readyState === "loading") {
-    document.addEventListener("DOMContentLoaded", initPerfModelAndPlotButtons);
+    document.addEventListener("DOMContentLoaded", initStaticUIListeners);
 } else {
-    initPerfModelAndPlotButtons();
+    initStaticUIListeners();
 }
 
 
@@ -1413,48 +1814,6 @@ comparisonMessageContainer.innerHTML = comparisonMessage;
 // Download CSV
 document.getElementById('download-csv').style.display = 'block';
 
-function downloadCSV2(data, filename = "gpu_tco_results.csv") {
-  if (!Array.isArray(data) || data.length === 0) {
-    console.error("Invalid data: must be a non-empty array.");
-    return;
-  }
-
-  const headers = [
-    "GPU",
-    "#GPUs",
-	"Total Perf (ns/day*atoms)",
-	"Total Power (W)",
-    "TCO (€)",
-    "Work-per-TCO (ns/€ * atoms)",
-    "Power-per-TCO (W/€)",
-    "Work-per-watt-per-TCO (ns/W/€ * atoms)",
-    "Baseline %"
-  ];
-
-  const rows = data.map(r => [
-    r.name,
-    r.n_gpu,
-	r.performance.toFixed(1),
-	r.power.toFixed(1),
-    Math.round(r.total_cost),
-    r.perf_per_tco.toFixed(1),
-    r.power_per_tco.toFixed(1),
-    r.perf_per_watt_per_tco.toFixed(3),
-    r.baseline_pct.toFixed(2)
-  ]);
-
-  const csvContent = [
-    headers.join(","),
-    ...rows.map(row => row.join(","))
-  ].join("\n");
-
-  downloadCSV(csvContent, filename);
-}
-
-document.getElementById("download-csv").addEventListener("click", () => {
-  downloadCSV2(window.results);
-});
-
 // Optional debug print
 console.table(window.results.map(r => ({
   GPU: r.name,
@@ -1681,31 +2040,33 @@ function renderChartsWithDownloads() {
       return;
     }
 
-    // Render Plotly chart
-    Plotly.newPlot(chart.id, chart.traces, chart.layout, { responsive: true });
+    // Render or update Plotly chart in-place
+    Plotly.react(chart.id, chart.traces, chart.layout, { responsive: true });
 
-    // Create download button container
-    const downloadDiv = document.createElement('div');
-    downloadDiv.classList.add('download-btn-container');
-    downloadDiv.innerHTML = `<button id="${chart.id}-download-btn">Download ${chart.label} Chart (High Resolution)</button>`;
+    // Create download button once per chart
+    if (!document.getElementById(`${chart.id}-download-btn`)) {
+      const downloadDiv = document.createElement('div');
+      downloadDiv.classList.add('download-btn-container');
+      downloadDiv.innerHTML = `<button id="${chart.id}-download-btn">Download ${chart.label} Chart (High Resolution)</button>`;
 
-    // Append button below chart
-    chartDiv.parentElement.appendChild(downloadDiv);
+      // Append button below chart
+      chartDiv.parentElement.appendChild(downloadDiv);
 
-    // Add click listener
-    document.getElementById(`${chart.id}-download-btn`).addEventListener('click', () => {
-      Plotly.toImage(chart.id, {
-        format: 'png',   // or 'svg'
-        height: 500,
-      //  width: 1200,
-        scale: 2
-      }).then(url => {
-        const link = document.createElement('a');
-        link.href = url;
-        link.download = chart.filename;
-        link.click();
+      // Add click listener once
+      document.getElementById(`${chart.id}-download-btn`).addEventListener('click', () => {
+        Plotly.toImage(chart.id, {
+          format: 'png',   // or 'svg'
+          height: 500,
+        //  width: 1200,
+          scale: 2
+        }).then(url => {
+          const link = document.createElement('a');
+          link.href = url;
+          link.download = chart.filename;
+          link.click();
+        });
       });
-    });
+    }
   });
 }
 
@@ -1822,35 +2183,36 @@ legend: {
   font: { size: 18 }       // ✅ default fallback font
 };
 
-// Render the Plotly chart
-Plotly.newPlot('stacked-tco-chart', [...capTraces, ...opTraces], tcoLayout, { displayModeBar: true });
-	
-// Add a button to download the plot as PNG or SVG with high resolution
-const downloadButtonDiv = document.createElement('div');
-downloadButtonDiv.classList.add('download-btn-container');
-downloadButtonDiv.innerHTML = `<button id="download-btn">Download TCO Breakdown Stack Chart (High Resolution)</button>`;
-document.getElementById('stacked-tco-chart').parentElement.insertBefore(downloadButtonDiv, document.getElementById('stacked-tco-chart'));
+// Render or update the Plotly chart in-place
+Plotly.react('stacked-tco-chart', [...capTraces, ...opTraces], tcoLayout, { displayModeBar: true });
 
-// Add event listener for the button
-document.getElementById('download-btn').addEventListener('click', () => {
-  Plotly.toImage('stacked-tco-chart', {
-    format: 'png',  // You can change this to 'svg' or 'jpeg' if needed
-    height: 400,    // Set height for high resolution
-    width: 1200,    // Set width for high resolution
-    scale: 2        // Increase scale for higher resolution
-  }).then(function (url) {
-    if (url) {
-      const link = document.createElement('a');
-      link.href = url;
-      link.download = 'tco_breakdown_high_res.png';  // Filename for the downloaded PNG
-      link.click();
-    } else {
-      console.error("Failed to generate image");
-    }
-  }).catch(err => {
-    console.error("Error during image generation:", err);
+// Add a button once to download the plot as PNG with high resolution
+if (!document.getElementById('download-btn')) {
+  const downloadButtonDiv = document.createElement('div');
+  downloadButtonDiv.classList.add('download-btn-container');
+  downloadButtonDiv.innerHTML = `<button id="download-btn">Download TCO Breakdown Stack Chart (High Resolution)</button>`;
+  document.getElementById('stacked-tco-chart').parentElement.insertBefore(downloadButtonDiv, document.getElementById('stacked-tco-chart'));
+
+  document.getElementById('download-btn').addEventListener('click', () => {
+    Plotly.toImage('stacked-tco-chart', {
+      format: 'png',  // You can change this to 'svg' or 'jpeg' if needed
+      height: 400,    // Set height for high resolution
+      width: 1200,    // Set width for high resolution
+      scale: 2        // Increase scale for higher resolution
+    }).then(function (url) {
+      if (url) {
+        const link = document.createElement('a');
+        link.href = url;
+        link.download = 'tco_breakdown_high_res.png';  // Filename for the downloaded PNG
+        link.click();
+      } else {
+        console.error("Failed to generate image");
+      }
+    }).catch(err => {
+      console.error("Error during image generation:", err);
+    });
   });
-});
+}
 
 /// ---------- Plotly Pi TCO Chart ----------
 const pieTraces = nonzeroResults.map((gpu, index) => {
@@ -1894,7 +2256,7 @@ legend: {
   margin: { t: 40, b: 60 }
 };
 
-Plotly.newPlot('pie-tco-chart', pieTraces, pieLayout);
+Plotly.react('pie-tco-chart', pieTraces, pieLayout);
 
 
 if (!document.getElementById('download-pie-btn')) {
@@ -1925,255 +2287,7 @@ if (!document.getElementById('download-pie-btn')) {
 }
 
 
-// ---------- Disable other sliders if the user selects Fix Budget and vice versa ----------
-function toggleSliders() {
-  const checkedRadio = document.querySelector('input[name="calculationMode"]:checked');
-  if (!checkedRadio) return;
-
-  const mode = checkedRadio.value;
-
-  // Hide all slider containers
-  document.querySelectorAll('.mode-slider').forEach(sliderDiv => {
-    sliderDiv.style.display = 'none';
-  });
-
-  // Show only the slider corresponding to the selected mode
-  const activeSlider = document.getElementById(`slider_${mode}`);
-  if (activeSlider) activeSlider.style.display = 'block';
-}
-
-// Initialize on page load and when mode changes
-function initSliderToggle() {
-  toggleSliders(); // initial setup
-
-  document.querySelectorAll('input[name="calculationMode"]').forEach(el => {
-    el.addEventListener('change', toggleSliders);
-  });
-}
-
-// Run initialization after DOM is ready
-window.addEventListener('DOMContentLoaded', initSliderToggle);
-
-
-// (showPerfModel and showPerfPlotsAllBenchmarks moved to module scope to prevent duplicate listeners on recalculate)
-
-// ---------- Show Power Model ----------
-document.getElementById("showPowerModelBtn").addEventListener("click", () => {
-    showPowerModel();
-});
-
-function showPowerModel() {
-    const rows = GPU_data.map(gpu => {
-        const f_ref = GPU_F_REF[gpu.name] ?? "N/A";
-        const tdp_ref = GPU_TDP_REF[gpu.name] ?? "N/A";
-        const dvfs = gpu.DVFS_PARAMS;
-
-        if (!dvfs || Object.keys(dvfs).length === 0) {
-            return `
-            <tr>
-                <td>${gpu.name}</td>
-                <td>${f_ref} MHz</td>
-                <td>${tdp_ref} W</td>
-                <td>No DVFS parameters available</td>
-            </tr>
-            `;
-        }
-
-        // Take the first workload & benchmark for display
-        const firstWorkload = Object.keys(dvfs)[0];
-        const firstBenchmark = Object.keys(dvfs[firstWorkload])[0];
-        const params = dvfs[firstWorkload][firstBenchmark];
-
-        const phiFormula = `
-φ(f_GPU) =
-{
-  ${params.b1} * f_GPU + ${params.c1},          if f_GPU ≤ ${params.f_t} * f_ref
-  ${params.a2} * f_GPU² + ${params.b2} * f_GPU + ${params.c2},  if f_GPU > ${params.f_t} * f_ref
-}`;
-
-        return `
-        <tr>
-            <td>${gpu.name}</td>
-            <td>${f_ref} MHz</td>
-            <td>${tdp_ref} W</td>
-            <td style="white-space: pre-line; font-family: monospace;">${phiFormula}</td>
-        </tr>
-        `;
-    }).join("");
-
-    // Create modal
-    const modal = document.createElement("div");
-    modal.style.position = "fixed";
-    modal.style.top = "5%";
-    modal.style.left = "5%";
-    modal.style.width = "90%";
-    modal.style.height = "90%";
-    modal.style.backgroundColor = "white";
-    modal.style.border = "2px solid #333";
-    modal.style.padding = "20px";
-    modal.style.zIndex = 1000;
-    modal.style.overflowY = "auto";
-    modal.innerHTML = `
-        <h2>GPU Power Model</h2>
-        <table style="width:100%; border-collapse: collapse;" border="1">
-            <thead>
-                <tr>
-                    <th>GPU</th>
-                    <th>f_base (MHz)</th>
-                    <th>W_TDP (W)</th>
-                    <th>Power Model W(f_GPU)=min(W_TDP, φ(f_GPU))</th>
-                </tr>
-            </thead>
-            <tbody>
-                ${rows}
-            </tbody>
-        </table>
-        <br>
-    `;
-
-    // Create close button separately and attach listener immediately
-    const closeBtn = document.createElement("button");
-    closeBtn.textContent = "Close";
-    closeBtn.addEventListener("click", () => {
-        document.body.removeChild(modal);
-    });
-
-    modal.appendChild(closeBtn);
-    document.body.appendChild(modal);
-}
-
-// ---------- Show Power Plots (All Benchmarks, All GPUs) ----------
-document.getElementById("showPowerPlotBtn").addEventListener("click", () => {
-  showPowerPlotsAllBenchmarks();
-});
-
-function showPowerPlotsAllBenchmarks() {
-  const container = document.getElementById("powerPlotContainer");
-  if (!container) {
-    console.error("powerPlotContainer not found in DOM");
-    return;
-  }
-
-  // --- NEW: side-by-side layout ---
-  container.innerHTML = "";
-  container.style.display = "flex";
-  container.style.flexWrap = "wrap";
-  container.style.gap = "20px";
-  container.style.justifyContent = "center";
-
-  const workload = document.getElementById("workload").value;
-
-  // Use benchmark list from first GPU
-  const benchmarkIds = Object.keys(GPU_data[0].DVFS_PARAMS[workload]);
-
-  benchmarkIds.forEach(benchmarkId => {
-
-    // --- NEW: wrapper per plot ---
-    const plotWrapper = document.createElement("div");
-    plotWrapper.style.width = "420px";
-	plotWrapper.style.height = "320px";
-    plotWrapper.style.border = "1px solid #ccc";
-    plotWrapper.style.padding = "10px";
-    plotWrapper.style.background = "#fafafa";
-    plotWrapper.style.color = "#000";
-
-    const title = document.createElement("h4");
-    title.textContent = `DVFS Power Model – ${workload}, Benchmark ${benchmarkId}`;
-    title.style.textAlign = "center";
-    title.style.color = "#000";
-
-    const canvas = document.createElement("canvas");
-    canvas.height = 300;
-	canvas.style.height = "380px";
-
-    plotWrapper.appendChild(title);
-    plotWrapper.appendChild(canvas);
-    container.appendChild(plotWrapper);
-
-    const ctx = canvas.getContext("2d");
-
-    let labels = null;
-    const datasets = [];
-
-    GPU_data.forEach(gpu => {
-      const f_ref = GPU_F_REF[gpu.name];
-      const dvfs = gpu.DVFS_PARAMS?.[workload]?.[benchmarkId];
-      if (!f_ref || !dvfs) return;
-
-      const freqs = [];
-      const powers = [];
-
-      const maxF = f_ref * 1.2;
-      const step = 15;
-
-      for (let f = 0; f <= maxF; f += step) {
-        freqs.push(Math.round(f));
-
-		const W_TDP  = gpu.tdp_ref;
-		
-		if (!W_TDP) return;
-				
-		let phi;
-		if (f <= dvfs.f_t) {
-		  phi = dvfs.b1 * f + dvfs.c1;
-		} else {
-		  phi = dvfs.a2 * f * f + dvfs.b2 * f + dvfs.c2;
-		}
-		
-		const power = Math.min(W_TDP, phi);
-		powers.push(power);
-      }
-
-      if (!labels) labels = freqs;
-
-      datasets.push({
-        label: gpu.name,
-        data: powers,
-        fill: false,
-        tension: 0.15,
-        borderWidth: 1.5,
-        pointRadius: 1
-      });
-    });
-
-    new Chart(ctx, {
-      type: "line",
-      data: {
-        labels,
-        datasets
-      },
-      options: {
-		  responsive: true,
-		  maintainAspectRatio: false,
-		  layout: {
-		    padding: {
-		      bottom: 50   // space for x-axis labels
-		    }
-		  },
-		  plugins: {
-		    legend: { position: "top" }
-		  },
-		  scales: {
-		    x: {
-		      title: {
-		        display: true,
-		        text: "GPU Graphics Frequency (MHz)"
-		      },
-		      ticks: {
-		        maxRotation: 0,
-		        autoSkip: true,
-		        maxTicksLimit: 6
-		      }
-		    },
-		  y: {
-		  min: 0,
-		  title: { display: true, text: "Power W(f_GPU)=min(W_TDP, φ(f_GPU))" }
-		}
-        }
-      }
-    });
-  });
-}
+// (toggleSliders, showPerfModel, showPerfPlotsAllBenchmarks, showPowerModel, and showPowerPlotsAllBenchmarks live at module scope to prevent duplicate listeners on recalculate)
 	
 // ---------- Parameter Sensitivities Analysis (% Uncertainty Contribution) ----------
 const elasticityLabels = [
@@ -2247,50 +2361,8 @@ function getActiveUncertaintyVector() {
   return ranges;
 }
 
-const globalSlider = document.getElementById("globalUncertainty");
-const globalLockIcon = document.getElementById("globalLockIcon");
-
-// Central function to sync sliders and lock icon
-function updateSlidersFromGlobal() {
-  const globalVal = parseFloat(globalSlider.value);
-  const isGlobal = globalVal > 0;
-
-  // Update global display
-  document.getElementById("v_globalUncertainty").innerText = globalVal;
-
-  // Show/hide lock
-globalLockIcon.style.display = isGlobal ? "inline-block" : "none";
-
-  // Update individual sliders
-  document.querySelectorAll(".paramUncertainty").forEach(slider => {
-    const span = slider.parentElement.querySelector(".uncValue");
-    if (isGlobal) {
-      slider.disabled = true;
-      slider.value = Math.round(globalVal);  // <-- ensure integer 0-100
-      if (span) span.innerText = slider.value;
-    } else {
-      slider.disabled = false;
-      // Do NOT overwrite value in individual mode
-      if (span) span.innerText = slider.value;
-    }
-  });
-}
-
-// Listen for global slider changes
-globalSlider.addEventListener("input", updateSlidersFromGlobal);
-
-// Listen for individual sliders to update their displayed value dynamically
-document.addEventListener("input", e => {
-  if (e.target.classList.contains("paramUncertainty")) {
-    const span = e.target.parentElement.querySelector(".uncValue");
-    if (span) span.innerText = e.target.value;
-  }
-});
-
-// Initialize sliders on page load
+// Sync uncertainty sliders state before sampling
 updateSlidersFromGlobal();
-
-const ACTIVE_METRICS = ["tco", "perf_per_tco", "power_per_tco", "perf_per_watt_per_tco"];
 
 // ---------- Compute Sensitivities for all metrics ----------
 const normalizeAcrossDimension = arr => {
@@ -2675,20 +2747,7 @@ const elasticityLabelsSymbols = [
 
 
 const metricSelector = document.getElementById("metricSelector");
-ACTIVE_METRICS.forEach(metric => {
-    const opt = document.createElement("option");
-    opt.value = metric;
-    opt.text = metricTitles[metric];
-    metricSelector.appendChild(opt);
-});
-
-metricSelector.addEventListener("change", e => {
-    const metric = e.target.value;
-    const visibility = heatmapData.map((_, i) => {
-        return Math.floor(i / 3) === ACTIVE_METRICS.indexOf(metric);
-    });
-    Plotly.update("sensitivityHeatmaps", { visible: visibility });
-});
+const selectedHeatmapMetric = metricSelector?.value || "tco";
 
 ACTIVE_METRICS.forEach((metric, metricIdx) => {
     const xLabels = window.results.map(r => r.name);
@@ -2703,7 +2762,7 @@ ACTIVE_METRICS.forEach((metric, metricIdx) => {
         zmin: -zMaxElasticity[metric],
         zmax: zMaxElasticity[metric],
         coloraxis: "coloraxisElasticity",
-        visible: metric === "tco",
+        visible: metric === selectedHeatmapMetric,
         name: `Elasticity-${metric}`,
         xaxis: "x1",
         yaxis: "y1"
@@ -2719,7 +2778,7 @@ ACTIVE_METRICS.forEach((metric, metricIdx) => {
         zmin: 0,
         zmax: 100,
         coloraxis: "coloraxisSM",
-        visible: metric === "tco",
+        visible: metric === selectedHeatmapMetric,
         name: `Sobol-${metric}`,
         xaxis: "x2",
         yaxis: "y2"
@@ -2735,7 +2794,7 @@ ACTIVE_METRICS.forEach((metric, metricIdx) => {
         zmin: 0,
         zmax: 100,
         coloraxis: "coloraxisSM",
-        visible: metric === "tco",
+        visible: metric === selectedHeatmapMetric,
         name: `MC-${metric}`,
         xaxis: "x3",
         yaxis: "y3"
@@ -2756,8 +2815,8 @@ const heatmapLayout = {
     yaxis3: { showticklabels: false },
 
     coloraxisElasticity: {
-        cmin: -zMaxElasticity.tco,
-        cmax: zMaxElasticity.tco,
+        cmin: -zMaxElasticity[selectedHeatmapMetric],
+        cmax: zMaxElasticity[selectedHeatmapMetric],
         colorbar: { title: { text: "Elasticity (%)", font: { size: fontSize } }, x: 1.05, xanchor: "center" }
     },
     coloraxisSM: {
@@ -2774,20 +2833,10 @@ const heatmapLayout = {
     ]
 };
 
-// Plot heatmaps
-Plotly.newPlot("sensitivityHeatmaps", heatmapData, heatmapLayout, {
+// Render or update heatmaps in-place
+Plotly.react("sensitivityHeatmaps", heatmapData, heatmapLayout, {
     responsive: true,
     displaylogo: false
-});
-
-// Download button
-document.getElementById("downloadBtn").addEventListener("click", () => {
-    Plotly.downloadImage(document.getElementById("sensitivityHeatmaps"), {
-        format: 'png',
-        width: 1600,
-        height: 900,
-        filename: 'sensitivity_heatmaps'
-    });
 });
 
 
@@ -2798,10 +2847,12 @@ function getGPUVector(matrix, gpuIndex) {
 }
 window.renderTornadoPlots = function renderTornadoPlots(metric) {
   const tornadoContainer = document.getElementById("gpuTornadoPlots");
-  tornadoContainer.innerHTML = "";
+  const activeIds = new Set();
 
   window.results.forEach((gpu, i) => {
     const gpuName = gpu.name;
+    const divId = `tornado-${gpuName.replace(/\s+/g, '-')}`;
+    activeIds.add(divId);
 
     // ✅ RAW (not normalized)
     const elasticityVec = getGPUVector(allElasticities[metric], i);
@@ -2833,7 +2884,7 @@ window.renderTornadoPlots = function renderTornadoPlots(metric) {
     };
 
     const layout = {
-      title: `${gpuName} – ${metricTitles[metric]}`,
+      title: `${gpuName} – ${METRIC_TITLES[metric]}`,
       barmode: "group",
       margin: { l: 200, r: 40, t: 50, b: 30 },
       height: 500,
@@ -2846,51 +2897,27 @@ window.renderTornadoPlots = function renderTornadoPlots(metric) {
       yaxis: { automargin: true }
     };
 
-    const chartDiv = document.createElement("div");
-    chartDiv.id = `tornado-${metric}-${gpuName.replace(/\s+/g, '-')}`;
-    tornadoContainer.appendChild(chartDiv);
+    let chartDiv = document.getElementById(divId);
+    if (!chartDiv) {
+      chartDiv = document.createElement("div");
+      chartDiv.id = divId;
+      tornadoContainer.appendChild(chartDiv);
+    }
 
-    Plotly.newPlot(chartDiv, [traceElasticity, traceSobol, traceMC], layout);
+    Plotly.react(chartDiv, [traceElasticity, traceSobol, traceMC], layout);
+  });
+
+  // Purge and remove any stale tornado divs if GPU list shrank
+  Array.from(tornadoContainer.children).forEach(child => {
+    if (!activeIds.has(child.id)) {
+      Plotly.purge(child);
+      child.remove();
+    }
   });
 };
-	
-renderTornadoPlots("tco");
 
-document
-  .getElementById("tornadoMetricSelect")
-  .addEventListener("change", e => {
-    renderTornadoPlots(e.target.value);
-  });
-
-
-// downloadCSV
-function downloadCSV(data, filename) {
-  if (!data) {
-    console.error("No data provided for CSV download.");
-    return;
-  }
-
-  if (!filename) {
-    console.error("No filename provided.");
-    return;
-  }
-  
-    try {
-    const blob = new Blob([data], { type: "text/csv;charset=utf-8;" });
-    const link = document.createElement("a");
-    const url = URL.createObjectURL(blob);
-    link.setAttribute("href", url);
-    link.setAttribute("download", filename);
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
-
-    // Optionally revoke the URL after download
-    URL.revokeObjectURL(url);
-  } catch (error) {
-    console.error("Error while downloading the CSV:", error);
-  }
-}
+const selectedTornadoMetric = document.getElementById("tornadoMetricSelect")?.value || "tco";
+renderTornadoPlots(selectedTornadoMetric);
 
 //return nonzeroResults;
 
@@ -2938,12 +2965,14 @@ function renderPerfPowerHeatmaps() {
   }
 
   const container = document.getElementById("gpuPerfPowerHeatmap");
-  container.innerHTML = `
-    <div style="display: flex; justify-content: space-between; flex-wrap: wrap; gap: 20px;">
-      <div id="perf-heatmap" style="flex: 1 1 48%; min-width: 300px;"></div>
-      <div id="power-heatmap" style="flex: 1 1 48%; min-width: 300px;"></div>
-    </div>
-  `;
+  if (!document.getElementById("perf-heatmap") || !document.getElementById("power-heatmap")) {
+    container.innerHTML = `
+      <div style="display: flex; justify-content: space-between; flex-wrap: wrap; gap: 20px;">
+        <div id="perf-heatmap" style="flex: 1 1 48%; min-width: 300px;"></div>
+        <div id="power-heatmap" style="flex: 1 1 48%; min-width: 300px;"></div>
+      </div>
+    `;
+  }
 
   const axisFont = {
     titlefont: { size: 31 },
@@ -2951,7 +2980,7 @@ function renderPerfPowerHeatmaps() {
   };
 
   // Performance heatmap
-  Plotly.newPlot(
+  Plotly.react(
     "perf-heatmap",
     [{
       z: perfData,
@@ -2975,7 +3004,7 @@ function renderPerfPowerHeatmaps() {
   );
 
   // Power heatmap
-  Plotly.newPlot(
+  Plotly.react(
     "power-heatmap",
     [{
       z: powerData,
@@ -3406,97 +3435,15 @@ function exportGPUDataCSV() {
 
   }
 
-// generatePDFReport
+// generatePDFReport (lazy-loaded on demand via pdfExport.js)
 async function generatePDFReport() {
-  const { jsPDF } = window.jspdf;
-  const doc = new jsPDF();
-
-  let y = 15;
-  const lineHeight = 7;
-  const wrap = (text, max) => doc.splitTextToSize(text, max || 180);
-
-  const now = new Date().toLocaleString();
-  const workload = document.getElementById("workload").value;
-  const benchmarkId = document.getElementById("benchmarkId").value;
-  const tip = document.getElementById("ai-tip-text").innerText;
-
-  const getVal = id => document.getElementById(id)?.value || "–";
-
-  const sliders = [
-    ["Total Budget (€)", "total_budget"],
-    ["Node Server", "C_node_server"],
-    ["Node Infra", "C_node_infra"],
-    ["Facility", "C_node_facility"],
-    ["Software", "C_software"],
-    ["Electricity (€/kWh)", "C_electricity"],
-    ["PUE", "C_PUE"],
-    ["System Usage (hrs/year)", "system_usage"],
-    ["Lifetime (yrs)", "lifetime"],
-    ["Baseline Power (W)", "W_node_baseline"],
-    ["Depreciation", "C_depreciation"],
-    ["Subscription", "C_subscription"],
-    ["Inefficiency", "C_uefficiency"],
-    ["Heat Revenue/kWh", "C_heatreuseperkWh"],
-    ["Heat Reuse Factor", "Factor_heatreuse"],
-    ["Maintenance", "C_maintenance"]
-  ];
-
-  const addHeader = (title) => {
-    doc.setFontSize(14);
-    doc.text(title, 15, y);
-    y += lineHeight;
-    doc.setFontSize(11);
-  };
-
-  const checkPage = () => {
-    if (y > 275) {
-      doc.addPage();
-      y = 15;
-    }
-  };
-
-  // --- Title
-  doc.setFontSize(16);
-  doc.text("Work-per-TCO Report", 15, y);
-  y += lineHeight;
-  doc.setFontSize(10);
-  doc.text(`Generated: ${now}`, 15, y);
-  y += lineHeight;
-
-  // --- Section 1: Inputs
-  addHeader("1. Input Parameters");
-  sliders.forEach(([label, id]) => {
-    checkPage();
-    doc.text(`${label}: ${getVal(id)}`, 15, y);
-    y += lineHeight;
-  });
-
-  // --- Section 2: Summary
-  y += 5; checkPage();
-  addHeader("2. Calculation Summary");
-
-  const best = window.bestResult;
-  if (best) {
-    doc.text(`Best GPU: ${best.name}`, 15, y); y += lineHeight;
-    doc.text(`Work-per-TCO: ${best.perf_per_tco.toExponential(3)} ns/€ * atoms`, 15, y); y += lineHeight;
-  } else {
-    doc.text("No calculation result found. Please calculate before exporting.", 15, y);
-    y += lineHeight;
+  try {
+    const { generatePDFReport: run } = await import('./pdfExport.js');
+    await run();
+  } catch (err) {
+    console.error("Failed to generate PDF report:", err);
+    alert("Could not load PDF export library. Please check your internet connection and try again.");
   }
-
-  // --- Section 3: AI Tip
-  y += 5; checkPage();
-  addHeader("3. Smart Strategy Tip");
-  const tipLines = wrap(tip);
-  tipLines.forEach(line => { doc.text(line, 15, y); y += lineHeight; });
-
-  // --- Footer
-  y += 10;
-  doc.setFontSize(8);
-  doc.text("Generated using Wattlytics Calculator – © 2025 Ayesha Afzal <mailto:ayesha.afzal@fau.de>, NHR@HPC, FAU Erlangen-Nürnberg", 15, 285);
-
-  // --- Save
-  doc.save(`Wattlytics_Report_${now.replace(/[^\d]/g, "_")}.pdf`);
 }
 
 function saveScenario(keyName) {
@@ -3748,23 +3695,14 @@ function simulateCalculation(scenario) {
 
 
 
-function downloadComparisonPDF() {
-  const element = document.getElementById('scenario-comparison');
-
-  if (!element) {
-    alert("❗ Please compare scenarios first!");
-    return;
+async function downloadComparisonPDF() {
+  try {
+    const { downloadComparisonPDF: run } = await import('./pdfExport.js');
+    await run();
+  } catch (err) {
+    console.error("Failed to download comparison PDF:", err);
+    alert("Could not load PDF export library. Please check your internet connection and try again.");
   }
-
-  const opt = {
-    margin:       0.5,
-    filename:     'scenario_comparison.pdf',
-    image:        { type: 'jpeg', quality: 0.98 },
-    html2canvas:  { scale: 2 },
-    jsPDF:        { unit: 'in', format: 'letter', orientation: 'portrait' }
-  };
-
-  html2pdf().set(opt).from(element).save();
 }
 
 /* --------------------
